@@ -4,6 +4,8 @@
 #include <conio.h>   // Windows用のキー入力 (_getch)
 #include <windows.h> // Windowsのシステム制御
 
+#pragma comment(lib, "user32.lib")
+
 #define MAX_CMDS 100
 #define CMD_LEN 1024
 #define VIEW_WINDOW 15
@@ -44,12 +46,11 @@ void save_all_items(CmdItem *items, int count) {
     }
 }
 
-// 登録処理 (addcmd) - Windows空行徹底排除版
+// 登録処理 (addcmd) - Windows完全重複排除＆初期15件表示版
 void do_addcmd() {
     char temp_history_path[512];
     snprintf(temp_history_path, sizeof(temp_history_path), "%s\\AppData\\Local\\Temp\\cmd_hist.txt", getenv("USERPROFILE"));
 
-    // ※ doskeyからの書き出しはバッチファイル（addcmd.bat）が行うため、ここではファイルを開くだけ
     #ifdef _WIN32
     SetConsoleOutputCP(932);
     SetConsoleCP(932);
@@ -61,60 +62,96 @@ void do_addcmd() {
         return;
     }
 
-    char history[MAX_CMDS][CMD_LEN];
-    int h_count = 0;
+    // 1. 一時的にファイル全体の行をそのまま格納する領域（最大5000行）
+    #define ALL_HIST_MAX 5000
+    static char all_lines[ALL_HIST_MAX][CMD_LEN];
+    int total_lines = 0;
     char line[CMD_LEN];
 
-    while (fgets(line, sizeof(line), fp)) {
-        // ★ 修正ポイント: 右側の改行コード (\r や \n) やスペースを徹底的に除去
+    while (fgets(line, sizeof(line), fp) && total_lines < ALL_HIST_MAX) {
+        // 右側の改行コード (\r や \n) やスペースを徹底的に除去
         int len = (int)strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
             line[--len] = '\0';
         }
         
-        // 文字列が空になったら確実にスキップ
+        // 空行は確実にスキップ
         if (len == 0) continue;
         
-        // addcmd や selcmd 自身を含む行は除外
-        if (strstr(line, "addcmd") || strstr(line, "selcmd")) continue;
+        // ツール自体の起動コマンド（mycmd、および単体の addcmd / selcmd）を厳密に除外
+        if (strncmp(line, "mycmd", 5) == 0 || strcmp(line, "addcmd") == 0 || strcmp(line, "selcmd") == 0) {
+            continue;
+        }
         
-        // 直前のコマンドと完全に一致する場合は重複としてスキップ
-        if (h_count > 0 && strcmp(history[(h_count - 1) % MAX_CMDS], line) == 0) continue;
-
-        strncpy(history[h_count % MAX_CMDS], line, CMD_LEN);
-        h_count++;
+        // いったんすべての行をそのまま溜める
+        strncpy(all_lines[total_lines], line, CMD_LEN);
+        total_lines++;
     }
     fclose(fp);
     remove(temp_history_path); // 読み終わったら一時ファイルを削除
 
-    int total_h = (h_count > MAX_CMDS) ? MAX_CMDS : h_count;
+    // 2. 後ろ（最新）から前（過去）に向かって走査し、一意なものだけを200件まで抽出
+    char history[MAX_CMDS][CMD_LEN];
+    int h_count = 0;
+
+    for (int i = total_lines - 1; i >= 0; i--) {
+        if (h_count >= MAX_CMDS) break;
+
+        int exists = 0;
+        for (int j = 0; j < h_count; j++) {
+            if (strcmp(history[j], all_lines[i]) == 0) {
+                exists = 1; // 既に格納済みのより新しい同じコマンドを発見
+                break;
+            }
+        }
+        // まだ登録されていなければ採用
+        if (!exists) {
+            strncpy(history[h_count], all_lines[i], CMD_LEN);
+            h_count++;
+        }
+    }
+
+    int total_h = h_count; // 重複を削った最終的な一意の件数
     if (total_h == 0) {
         printf("登録できるヒストリーがありません。(ファイル内が空、または除外対象のみです)\n");
         return;
     }
 
+    // 初期選択位置：配列の [0] （＝ 一番新しいコマンド ＝ 画面の最下部）
     int selected = 0;
-    int top_view = 0;
+    // 初期状態の表示ウィンドウ基準（最新の15件を表示）
+    int top_view = (total_h > VIEW_WINDOW) ? VIEW_WINDOW - 1 : total_h - 1;
 
+    // 3. インタラクティブ画面ループ
     while (1) {
         clear_screen();
         printf("--- 登録する履歴を選択してください (addcmd) [%d件] ---\n", total_h);
 
-        if (selected < top_view) top_view = selected;
-        if (selected >= top_view + VIEW_WINDOW) top_view = selected - VIEW_WINDOW + 1;
+        // スクロール枠の連動計算
+        if (selected > top_view) {
+            top_view = selected;
+        }
+        if (selected <= top_view - VIEW_WINDOW) {
+            top_view = selected + VIEW_WINDOW - 1;
+        }
 
-        int end_view = (top_view + VIEW_WINDOW > total_h) ? total_h : top_view + VIEW_WINDOW;
+        int end_idx = top_view;               
+        int start_idx = end_idx - VIEW_WINDOW + 1; 
+        if (start_idx < 0) start_idx = 0;
+        if (end_idx >= total_h) end_idx = total_h - 1;
 
-        for (int i = end_view - 1; i >= top_view; i--) {
-            int idx = (h_count - 1 - i + MAX_CMDS) % MAX_CMDS;
+        // 描画：上（古い＝インデックス大）から 下（新しい＝インデックス小＝[1]）へ
+        for (int i = end_idx; i >= start_idx; i--) {
+            int display_num = i + 1; 
+
             if (i == selected) {
-                printf(" > [%d] %s\n", i + 1, history[idx]);
+                printf(" > [%d] %s\n", display_num, history[i]);
             } else {
-                printf("   [%d] %s\n", i + 1, history[idx]);
+                printf("   [%d] %s\n", display_num, history[i]);
             }
         }
         printf("--------------------------------------------------\n");
-        printf("(上下矢印:選択 / Enter:登録 / ESC:終了)\n");
+        printf("(上矢印:古い履歴(上)へ遡る / 下矢印:新しい履歴(下)へ戻る / Enter:登録 / ESC:終了)\n");
 
         int ch = _getch();
         if (ch == 27) {
@@ -126,18 +163,41 @@ void do_addcmd() {
             get_data_path(data_path, sizeof(data_path));
             FILE *df = fopen(data_path, "a");
             if (df) {
-                int idx = (h_count - 1 - selected + MAX_CMDS) % MAX_CMDS;
-                fprintf(df, "%s\n", history[idx]);
+                fprintf(df, "%s\n", history[selected]);
                 fclose(df);
-                printf("「%s」を共通リストに保存しました。\n", history[idx]);
+                printf("「%s」を共通リストに保存しました。\n", history[selected]);
             }
             return;
         }
         if (ch == 0 || ch == 224) {
             ch = _getch();
-            if (ch == 72 && total_h > 0) { selected = (selected + 1) % total_h; } 
-            if (ch == 80 && total_h > 0) { selected = (selected - 1 + total_h) % total_h; } 
+            // 上矢印：古い方（画面の上＝配列のインデックスを増やす）
+            if (ch == 72) { 
+                if (selected < total_h - 1) selected++;
+            } 
+            // 下矢印：新しい方（画面の下＝配列のインデックスを減らす）
+            if (ch == 80) { 
+                if (selected > 0) selected--;
+            } 
         }
+    }
+}
+
+// Windows APIを使って安全に文字列をクリップボードにコピーする関数
+void copy_to_clipboard(const char *text) {
+    size_t len = strlen(text);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+    if (!hMem) return;
+
+    memcpy(GlobalLock(hMem), text, len + 1);
+    GlobalUnlock(hMem);
+
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_TEXT, hMem);
+        CloseClipboard();
+    } else {
+        GlobalFree(hMem);
     }
 }
 
@@ -262,9 +322,13 @@ void do_selcmd(int sort_abc) {
         if (ch == 13) { 
             if (match_count > 0) {
                 int target_idx = matched_indices[selected];
-                char clip_cmd[CMD_LEN + 64];
-                snprintf(clip_cmd, sizeof(clip_cmd), "echo | set /p=\"%s\" | clip", items[target_idx].cmd);
-                system(clip_cmd);
+
+                // ★追加した関数を呼び出すだけ！超安全でシンプルに
+                copy_to_clipboard(items[target_idx].cmd);
+
+                // char clip_cmd[CMD_LEN + 64];
+                // snprintf(clip_cmd, sizeof(clip_cmd), "echo | set /p=\"%s\" | clip", items[target_idx].cmd);
+                // system(clip_cmd);
             }
             return;
         }
